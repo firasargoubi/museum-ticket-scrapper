@@ -1,0 +1,79 @@
+name: Nintendo Museum watcher
+
+on:
+  schedule:
+    # GitHub often starts scheduled jobs a few minutes late, so the job starts
+    # early and the script waits for :00 sharp. The second line is a backup in
+    # case GitHub skips one; when both run, the backup gives a second look ~2 min
+    # after the hour. Times are UTC; :00 is the same moment in Japan.
+    - cron: "47 * * * *"
+    - cron: "53 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Test run: send what it sees (with a screenshot) to Discord right now"
+        type: boolean
+        default: true
+
+concurrency:
+  group: museum-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Cache the browser
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install the browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Restore what the last check saw
+        uses: actions/cache/restore@v6
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check the calendar
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WATCH_MONTHS: "2026-10,2026-11"
+          HEARTBEAT_HOUR_JST: "9"
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.test && 'test' || 'scheduled' }}
+          WAIT_FOR_HOUR: ${{ github.event_name == 'schedule' && '1' || '0' }}
+        run: python watcher.py
+
+      - name: Remember what this check saw
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Keep screenshots for debugging
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: calendar-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/
+          retention-days: 2
+          if-no-files-found: ignore
