@@ -34,7 +34,6 @@ HEARTBEAT_HOUR = int(os.environ.get("HEARTBEAT_HOUR_JST", "9"))
 PING_EVERYONE = os.environ.get("PING_EVERYONE", "1") == "1"
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state/state.json"))
 OUT_DIR = Path(os.environ.get("OUT_DIR", "out"))
-MAX_MONTH_CLICKS = 3
 
 
 def log(*args):
@@ -174,41 +173,51 @@ EXTRACT_JS = r"""
 }
 """
 
-# Finds the calendar's "next month" control, inside the calendar area only.
-# It never picks a date cell, a login/buy link, or a link leaving the calendar.
-FIND_NEXT_JS = r"""
-() => {
-  document.querySelectorAll('[data-watch-next]').forEach(e => e.removeAttribute('data-watch-next'));
-  const area = document.querySelector('[data-watch-root]');
-  if (!area) return null;
-  const cands = area.querySelectorAll('button, a, [role=button], [onclick], [class*=next i], [class*=arrow i], [aria-label]');
-  let best = null, bestScore = 0;
-  for (const el of cands) {
-    if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
-    const cls = el.getAttribute('class') || '';
-    if (/disabled|is-disabled/i.test(cls)) continue;
-    if (!el.getClientRects().length) continue;
-    if (el.querySelector('img[src*="calendar_"]')) continue;          // a date cell
-    const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
-    if (/ログイン|購入|申し?込|login|sign in|buy|purchase/i.test(txt)) continue;
-    if (/^\d{1,2}$/.test(txt)) continue;                               // a date cell
-    if (el.tagName === 'A') {
-      const href = el.getAttribute('href') || '';
-      if (href && !/^(#|javascript:)/i.test(href) && !/calendar/i.test(href)) continue;
+# Finds the tab for one month ("10月 販売中", "11月 販売中", ...) and tags it so
+# Python can click it. Never picks a date cell or a link that leaves the calendar.
+FIND_TAB_JS = r"""
+(mo) => {
+  document.querySelectorAll('[data-watch-tab]').forEach(e => e.removeAttribute('data-watch-tab'));
+  const clean = (t) => (t || '').replace(/\s+/g, ' ').trim();
+  const re = new RegExp('^' + mo + '\\s*月(?!\\s*(?:分|\\d))');
+  const isActive = (el) => {
+    for (let c = el, i = 0; c && i < 2; c = c.parentElement, i++) {
+      const cls = c.getAttribute('class') || '';
+      if (/(^|[-_\s])(active|current|selected|is-on|on)([-_\s]|$)/i.test(cls) ||
+          c.getAttribute('aria-selected') === 'true' || c.getAttribute('aria-current')) return true;
     }
-    const imgs = [...el.querySelectorAll('img')].map(i => (i.getAttribute('src') || '') + ' ' + (i.getAttribute('alt') || '')).join(' ');
-    const label = [el.getAttribute('aria-label'), el.getAttribute('title'), cls, imgs].join(' ');
-    let s = 0;
-    if (/次の?月|翌月|next\s*month/i.test(label + ' ' + txt)) s = 3;
-    else if (/(^|[-_\s])next([-_\s]|$)|arrow[-_]?right|right[-_]?arrow|chevron[-_]?right/i.test(label)) s = 2;
-    else if (['>', '›', '＞', '→', '次へ', '▶', '»', '〉'].includes(txt)) s = 2;
-    if (s > bestScore) { best = el; bestScore = s; }
+    return false;
+  };
+  const scopes = [document.querySelector('[data-watch-root]'), document.body].filter(Boolean);
+  for (const scope of scopes) {
+    let best = null;
+    for (const el of scope.querySelectorAll('*')) {
+      if (['script', 'style', 'option', 'select'].includes(el.tagName.toLowerCase())) continue;
+      if (!el.getClientRects().length) continue;
+      const t = clean(el.innerText);
+      if (!t || t.length > 12 || !re.test(t)) continue;
+      if (el.querySelector('img[src*="calendar_"]')) continue;        // a date cell
+      const a = el.closest('a');
+      if (a) {
+        const h = a.getAttribute('href') || '';
+        if (h && !/^(#|javascript:)/i.test(h) && !/calendar/i.test(h)) continue;
+      }
+      if (!best || el.contains(best)) best = el;                      // keep the whole tab
+    }
+    if (best) {
+      best.setAttribute('data-watch-tab', '1');
+      return { text: clean(best.innerText), active: isActive(best) };
+    }
   }
-  if (!best) return null;
-  best.setAttribute('data-watch-next', '1');
-  return { text: (best.innerText || '').trim().slice(0, 30), cls: best.getAttribute('class') || '', score: bestScore };
+  return null;
 }
 """
+
+# A fingerprint of the calendar's day cells, to confirm a tab click changed the month.
+SIG_JS = r"""() => [...document.querySelectorAll('img[src*="calendar_"]')]
+  .map(i => { const c = i.closest('td, li, button, a') || i.parentElement || i;
+              return (c.innerText || '').trim() + ':' + (i.getAttribute('src') || '').split('/').pop(); })
+  .join('|')"""
 
 WAIT_ICONS_JS = """() => document.querySelectorAll(
   'img[src*="calendar_circle"], img[src*="calendar_hyphen"], img[src*="calendar_diamond"]').length > 3"""
@@ -234,11 +243,26 @@ def settle(page, quick=False):
     page.wait_for_timeout(500)
 
 
-def snap(page, name):
-    """Screenshot of the calendar area when we know it, else the whole page."""
+SHOT_AREA_JS = r"""() => {
+  document.querySelectorAll('[data-watch-shot]').forEach(e => e.removeAttribute('data-watch-shot'));
+  const a = document.querySelector('[data-watch-root]'), t = document.querySelector('[data-watch-tab]');
+  if (!a) return false;
+  let c = a;
+  if (t) { while (c && !c.contains(t)) c = c.parentElement; }      // widen to include the month tabs
+  if (!c || c === document.body || c === document.documentElement) c = a;
+  c.setAttribute('data-watch-shot', '1');
+  return true;
+}"""
+
+
+def snap(page, name, month=None):
+    """Screenshot of the calendar (with its month tabs) when we know where it is, else the whole page."""
     path = OUT_DIR / f"{name}.jpg"
     try:
-        area = page.locator("[data-watch-root]").first
+        if month:
+            page.evaluate(FIND_TAB_JS, month)   # re-find the tab: the page may have redrawn it
+        page.evaluate(SHOT_AREA_JS)
+        area = page.locator("[data-watch-shot]").first
         if area.count():
             area.screenshot(path=str(path), type="jpeg", quality=75)
             return path
@@ -248,54 +272,97 @@ def snap(page, name):
     return path
 
 
-def read_calendar():
-    """Returns dict(marks, shots, problem, info)."""
+def wanted_months():
+    """Watched months that aren't over yet, e.g. ['2026-10', '2026-11']."""
+    cur = dt.datetime.now(JST).strftime("%Y-%m")
+    return [m for m in WATCH_MONTHS if m >= cur]
+
+
+def on_site(url):
+    return any(h in url for h in ("museum-tickets.nintendo.com", "localhost", "127.0.0.1"))
+
+
+def open_month(page, ym):
+    """Click the month's tab and wait until the calendar shows it. Returns (ok, why_not)."""
+    mo = int(ym[5:])
+    tab = page.evaluate(FIND_TAB_JS, mo)
+    if not tab:
+        return False, f"couldn't find the {mo}月 tab"
+    if tab["active"]:
+        return True, None
+    before = page.evaluate(SIG_JS)
+    log(f"opening the {tab['text']} tab")
+    page.click('[data-watch-tab="1"]', timeout=5000)
+    changed = True
+    try:
+        page.wait_for_function(f"(prev) => ({SIG_JS})() !== prev", arg=before, timeout=10000)
+    except PWTimeout:
+        changed = False
+    settle(page, quick=True)
+    if not on_site(page.url):
+        return False, f"clicking the {mo}月 tab left the calendar ({page.url[:80]})"
+    if not changed:
+        again = page.evaluate(FIND_TAB_JS, mo)
+        if not (again and again["active"]):
+            return False, f"the {mo}月 tab didn't open"
+    return True, None
+
+
+def read_calendar(wait_until_hour=False):
+    """Returns dict(marks, shots, problem, warning, info)."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     responses = []
     with sync_playwright() as p:
+        # Start the browser first so that at :00 the only thing left is loading the page.
         browser = p.chromium.launch()
         ctx = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo",
                                   viewport={"width": 1280, "height": 1600})
         page = ctx.new_page()
         page.on("response", lambda r: responses.append(r))
+        if wait_until_hour:
+            wait_for_top_of_hour()
         try:
+            log("loading the calendar")
             resp = page.goto(CALENDAR_URL, wait_until="domcontentloaded", timeout=45000)
             status = resp.status if resp else None
             settle(page)
 
-            shots, all_marks, info = [], [], {"status": status, "views": []}
-            seen_months = set()
-            for view in range(MAX_MONTH_CLICKS + 1):
+            # Whatever month the page opens on (January, right now): only used to
+            # locate the calendar and for debugging. It isn't reported.
+            first = page.evaluate(EXTRACT_JS)
+            (OUT_DIR / "page-default.html").write_text(page.content(), encoding="utf-8")
+            default_shot = snap(page, "calendar-default")
+            info = {"status": status, "bodyStart": first["bodyStart"], "title": first["title"],
+                    "default": {"icons": first["iconCount"], "placed": len(first["marks"]),
+                                "headers": first["headers"]},
+                    "months": {}}
+
+            shots, all_marks, missing = [], [], []
+            for ym in wanted_months():
+                ok, why = open_month(page, ym)
+                if not ok:
+                    log("problem:", why)
+                    missing.append(why)
+                    if not on_site(page.url):
+                        break
+                    continue
+                y, mo = int(ym[:4]), int(ym[5:])
                 data = page.evaluate(EXTRACT_JS)
-                (OUT_DIR / f"page-{view}.html").write_text(page.content(), encoding="utf-8")
-                shots.append(snap(page, f"calendar-{view}"))
+                marks = []
                 for m in data["marks"]:
-                    m["view"] = view
-                all_marks.extend(data["marks"])
-                months_here = {(m["y"], m["m"]) for m in data["marks"] if m["m"]}
-                info["views"].append({"url": page.url, "title": data["title"], "icons": data["iconCount"],
-                                      "legend": data["legend"], "placed": len(data["marks"]),
-                                      "months": sorted(f"{y}-{mo:02d}" if y else f"?-{mo:02d}" for y, mo in months_here),
-                                      "headers": data["headers"]})
-                if view == 0:
-                    info["bodyStart"] = data["bodyStart"]
-                new_months = months_here - seen_months
-                seen_months |= months_here
-                # Stop once every watched month we still care about has been seen.
-                wanted = {mk for mk in WATCH_MONTHS if mk >= dt.datetime.now(JST).strftime("%Y-%m")}
-                got = {f"{y}-{mo:02d}" for y, mo in seen_months if y}
-                if wanted <= got or not data["marks"] or (view > 0 and not new_months):
-                    break
-                nxt = page.evaluate(FIND_NEXT_JS)
-                if not nxt:
-                    break
-                log(f"opening next month via {nxt}")
-                page.click('[data-watch-next="1"]', timeout=5000)
-                settle(page, quick=True)
-                if "museum-tickets.nintendo.com" not in page.url and "localhost" not in page.url \
-                        and "127.0.0.1" not in page.url:
-                    info["leftCalendar"] = page.url
-                    break
+                    if m["how"].startswith("attr"):          # the page gave a full date
+                        if (m["y"], m["m"]) != (y, mo):
+                            continue
+                    else:                                     # day number only: it's this tab's month
+                        m["y"], m["m"] = y, mo
+                    m["month"] = ym
+                    marks.append(m)
+                (OUT_DIR / f"page-{ym}.html").write_text(page.content(), encoding="utf-8")
+                shots.append(snap(page, f"calendar-{ym}", month=mo))
+                info["months"][ym] = {"icons": data["iconCount"], "placed": len(marks)}
+                if not marks:
+                    missing.append(f"couldn't read any days in the {mo}月 calendar")
+                all_marks.extend(marks)
 
             # keep JSON the page fetched, to help adjust the parser if needed
             for i, r in enumerate(responses[:80]):
@@ -312,15 +379,18 @@ def read_calendar():
 
     (OUT_DIR / "marks.json").write_text(json.dumps({"info": info, "marks": all_marks},
                                                    ensure_ascii=False, indent=1), encoding="utf-8")
-    problem = None
+    problem = warning = None
     if status and status >= 400:
         problem = f"the site answered HTTP {status} (it may be blocking automated visits)"
     elif "accounts.nintendo.com" in final_url:
         problem = "the calendar now redirects to the Nintendo Account login page"
     elif not all_marks:
-        hint = (info.get("bodyStart") or "")[:120]
-        problem = f"couldn't find any dated ○ / − marks on the calendar (page starts: “{hint}”)"
-    return {"marks": all_marks, "shots": shots, "problem": problem, "info": info}
+        problem = "; ".join(missing) or "couldn't find any dated ○ / − marks on the calendar"
+    elif missing:
+        warning = "; ".join(missing)
+    if problem and not shots:
+        shots = [default_shot]
+    return {"marks": all_marks, "shots": shots, "problem": problem, "warning": warning, "info": info}
 
 
 # --------------------------------------------------------------------------
@@ -404,18 +474,37 @@ def save_state(state):
 
 
 def wait_for_top_of_hour():
+    """Block until :00:01. If GitHub started us late (after :00), go straight away."""
     now = dt.datetime.now(dt.timezone.utc)
-    if now.minute >= 40:
-        target = (now + dt.timedelta(hours=1)).replace(minute=0, second=3, microsecond=0)
-        secs = (target - now).total_seconds()
-        log(f"waiting {secs:.0f}s for {target.astimezone(JST):%H:%M:%S} JST")
-        time.sleep(max(0, secs))
-    else:
+    if now.minute < 40:
         log("already past the hour; checking now")
+        return
+    target = (now + dt.timedelta(hours=1)).replace(minute=0, second=1, microsecond=0)
+    log(f"browser ready; waiting {(target - now).total_seconds():.0f}s for {target.astimezone(JST):%H:%M:%S} JST")
+    while True:
+        left = (target - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        if left <= 0:
+            break
+        time.sleep(min(left, 30))
 
 
 def bullet(keys):
     return "\n".join(f"• {label(k)}" for k in keys)
+
+
+def month_lines(result, open_dates, sold_out):
+    """One line per watched month: what's open, how many days are sold out."""
+    lines = []
+    for ym in wanted_months():
+        name = dt.date(int(ym[:4]), int(ym[5:]), 1).strftime("%B")
+        if ym not in result["info"].get("months", {}):
+            lines.append(f"**{name}:** couldn't read this month")
+            continue
+        o = [k for k in open_dates if k.startswith(ym)]
+        s = sum(1 for k in sold_out if k.startswith(ym))
+        lines.append(f"**{name}:** " + (f"{len(o)} open — " + ", ".join(label(k) for k in o) if o else "nothing open")
+                     + f" · {s} sold out")
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -430,46 +519,42 @@ def main():
     if MODE != "test" and all(mk < now.strftime("%Y-%m") for mk in WATCH_MONTHS):
         log("all watched months are over; nothing to do (you can disable the workflow)")
         return 0
-    if WAIT_FOR_HOUR and MODE != "test":
-        wait_for_top_of_hour()
-    now = dt.datetime.now(JST)
-
     state = load_state()
     result = None
     for attempt in range(2):
         try:
-            result = read_calendar()
+            # Waiting happens inside, after the browser is up. Once it's past :00 it returns at once.
+            result = read_calendar(wait_until_hour=WAIT_FOR_HOUR and MODE != "test")
         except Exception as e:
             traceback.print_exc()
             result = {"marks": [], "shots": [], "problem": f"the page didn't load ({type(e).__name__}: {str(e)[:160]})",
-                      "info": {}}
+                      "warning": None, "info": {}}
         if not result["problem"]:
             break
         log("problem:", result["problem"], "— retrying in 20s" if attempt == 0 else "")
         if attempt == 0:
             time.sleep(20)
 
-    stamp = dt.datetime.now(JST).strftime("%a %d %b %H:%M:%S JST")
+    now = dt.datetime.now(JST)
+    stamp = now.strftime("%a %d %b %H:%M:%S JST")
     problem = result["problem"]
     open_dates, unclear, sold_out = summarise(result["marks"]) if not problem else ([], [], [])
     current = open_dates + unclear
     log("info:", json.dumps(result["info"], ensure_ascii=False))
-    log(f"open: {open_dates}  unclear: {unclear}  sold out: {len(sold_out)}  problem: {problem}")
+    log(f"open: {open_dates}  unclear: {unclear}  sold out: {len(sold_out)}  problem: {problem}  warning: {result.get('warning')}")
 
     if MODE == "test":
-        views = result["info"].get("views", [])
         lines = ["🧪 **Watcher test run** (" + stamp + ")"]
         if problem:
             lines.append(f"⚠️ Problem: {problem}")
         else:
-            lines.append(f"Read the calendar ✅ — {len(open_dates)} date(s) open, {len(sold_out)} sold out "
-                         f"in {', '.join(WATCH_MONTHS)}; months seen: {', '.join(sorted({m for v in views for m in v['months']})) or 'none'}.")
-            lines.append("**Open now:**\n" + bullet(current) if current else "Nothing open right now.")
-        lines.append("Compare with the screenshot(s) and the real calendar. If they don't match, download the "
+            lines.append("Read the calendar ✅" + (f" (but {result['warning']})" if result.get("warning") else ""))
+            lines += month_lines(result, open_dates, sold_out)
+        lines.append("Compare with the screenshots and the real calendar. If they don't match, download the "
                      "`calendar-…` artifact from this GitHub run and send it to Claude.")
         discord("\n".join(lines), files=result["shots"])
         if not problem:
-            state.update(open=current, error=None, last_ok=stamp)
+            state.update(open=current, error=None, warn=result.get("warning"), last_ok=stamp)
         save_state(state)
         return 0
 
@@ -489,6 +574,15 @@ def main():
         discord(f"✅ Museum watcher is reading the calendar again ({stamp}).")
         state["error"] = None
 
+    warning = result.get("warning")
+    if warning and state.get("warn") != warning:
+        discord(f"⚠️ Museum watcher: {warning} ({stamp}). It's still watching the other month(s).",
+                files=result["shots"])
+        state["warn"] = warning
+    elif not warning and state.get("warn"):
+        discord(f"✅ Museum watcher can read every watched month again ({stamp}).")
+        state["warn"] = None
+
     new = [k for k in current if k not in set(state.get("open") or [])]
     if new:
         still = [k for k in current if k not in new]
@@ -498,7 +592,7 @@ def main():
         if still:
             msg.append("Also still open:\n" + bullet(still))
         msg.append(f"-# checked {stamp}")
-        discord("\n".join(msg), files=result["shots"][:2], ping=PING_EVERYONE)
+        discord("\n".join(msg), files=result["shots"], ping=PING_EVERYONE)
 
     today = now.date().isoformat()
     if now.hour == HEARTBEAT_HOUR and state.get("last_heartbeat") != today:
